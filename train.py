@@ -27,7 +27,7 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, RecursiveGPTConfig, RecursiveGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -49,7 +49,11 @@ gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
 batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
+model_type = "gpt"
 n_layer = 12
+n_prelayer = 0
+n_hiddenlayer = 0
+n_postlayer = 0
 n_head = 12
 n_embd = 768
 dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
@@ -144,7 +148,7 @@ if os.path.exists(meta_path):
     print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
 
 # model init
-model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+model_args = dict(n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
@@ -153,9 +157,17 @@ if init_from == 'scratch':
     if meta_vocab_size is None:
         print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
     model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
-    gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    if model_type == "gpt":
+        gptconf = GPTConfig(**model_args, n_layer=n_layer)
+        model = GPT(gptconf)
+    elif model_type == "RecursiveGPT":
+        recursiveconf = RecursiveGPTConfig(**model_args, n_prelayer=n_prelayer, n_hiddenlayer=n_hiddenlayer, n_postlayer=n_postlayer)
+        model = RecursiveGPT(recursiveconf)
+    else:
+        raise ValueError(f"Unknown model_type: {model_type}")
 elif init_from == 'resume':
+    if model_type != "gpt":
+        raise NotImplementedError("Resuming is only implemented for GPT model type.")
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
     ckpt_path = os.path.join(out_dir, 'ckpt.pt')
@@ -179,6 +191,8 @@ elif init_from == 'resume':
     iter_num = checkpoint['iter_num']
     best_val_loss = checkpoint['best_val_loss']
 elif init_from.startswith('gpt2'):
+    if model_type != "gpt":
+        raise NotImplementedError("Initializing from GPT-2 is only implemented for GPT model type.")
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
@@ -324,6 +338,11 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
+        if wandb_log:
+            wandb.log({"iter": iter_num, 
+                       "train/loss": lossf,
+                       "time/iter": dt*1000,
+                       })
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
     iter_num += 1
     local_iter_num += 1
